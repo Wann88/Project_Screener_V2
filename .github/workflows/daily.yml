@@ -2,9 +2,9 @@ name: Saham Daily Bot
 
 on:
   schedule:
-    # 18:40 WITA = 10:40 UTC
+    # Berjalan Senin-Jumat jam 18.40 WITA (10:40 UTC)
     - cron: '40 10 * * 1-5'
-  workflow_dispatch:
+  workflow_dispatch: # Memungkinkan tombol 'Run manual'
 
 jobs:
   run-bot:
@@ -16,10 +16,10 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.12'
+          python-version: '3.12' # Menggunakan versi terbaru agar kompatibel
 
       - name: Install Dependencies
-        run: pip install pandas yfinance pandas_ta requests
+        run: pip install pandas yfinance pandas-ta requests
 
       - name: Run Script
         env:
