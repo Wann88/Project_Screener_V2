@@ -4,6 +4,7 @@ import time
 import requests
 import os
 import sys
+import numpy as np
 
 # Coba import pandas_ta, jika gagal pakai fallback manual
 try:
@@ -57,6 +58,9 @@ def calculate_technical(df):
         df['SMA_200'] = df.ta.sma(length=200)
         df['SMA_50'] = df.ta.sma(length=50)
 
+        # 4. ATR (Average True Range) untuk Target Price
+        df['ATR'] = df.ta.atr(length=14)
+
     else:
         # --- MANUAL CALCULATION (FALLBACK) ---
         # 1. RSI 14
@@ -71,14 +75,21 @@ def calculate_technical(df):
         d = df['Close'].ewm(span=26, adjust=False).mean()
         df['MACD_12_26'] = k - d
         # MACDh_12_26_9 adalah Histogram (MACD - Signal)
-        # Note: Nama kolom harus disamakan manual agar logic di bawah tetap jalan
         df['MACDh_12_26_9'] = df['MACD_12_26'] - df['MACD_12_26'].ewm(span=9, adjust=False).mean() 
         
         # 3. Moving Averages
         df['SMA_200'] = df['Close'].rolling(window=200).mean()
         df['SMA_50'] = df['Close'].rolling(window=50).mean()
 
-    # 4. Volume Moving Average (Sama untuk kedua mode)
+        # 4. ATR (Average True Range) Manual
+        high_low = df['High'] - df['Low']
+        high_close = (df['High'] - df['Close'].shift()).abs()
+        low_close = (df['Low'] - df['Close'].shift()).abs()
+        ranges = pd.concat([high_low, high_close, low_close], axis=1)
+        true_range = ranges.max(axis=1)
+        df['ATR'] = true_range.rolling(window=14).mean()
+
+    # 5. Volume Moving Average (Sama untuk kedua mode)
     df['VOL_MA5'] = df['Volume'].rolling(window=5).mean()
 
     return df
@@ -96,11 +107,9 @@ def process_batch(tickers):
         print(f"Error download batch: {e}")
         return []
 
-    # Handle single ticker result format
     if len(tickers) == 1:
         data = {tickers[0]: data}
 
-    # Iterasi setiap ticker dalam batch
     for ticker in tickers:
         try:
             if len(tickers) == 1:
@@ -119,7 +128,6 @@ def process_batch(tickers):
             if df is None:
                 continue
 
-            # Ambil data hari terakhir
             curr = df.iloc[-1]
             prev = df.iloc[-2]
 
@@ -127,12 +135,11 @@ def process_batch(tickers):
             score = 0
             reasons = []
 
-            # 1. Filter Likuiditas Minimum (Harga > 50 & Volume > 1000 lembar)
+            # 1. Filter Likuiditas Minimum
             if curr['Close'] < 50 or curr['Volume'] < 1000:
                 continue
 
             # 2. RSI Oversold tapi Mulai Rebound
-            # Pastikan kolom RSI ada (pandas-ta kadang return NaN di awal data, tapi kita ambil iloc[-1])
             if pd.isna(curr['RSI']): continue
             
             if curr['RSI'] < 30:
@@ -143,7 +150,6 @@ def process_batch(tickers):
                 reasons.append("RSI Murah (<40)")
             
             # 3. MACD Golden Cross atau Menguat
-            # Pastikan kolom MACD ada
             if 'MACDh_12_26_9' in df.columns:
                 macd_h_now = curr['MACDh_12_26_9']
                 macd_h_prev = prev['MACDh_12_26_9']
@@ -154,29 +160,38 @@ def process_batch(tickers):
                 elif macd_h_now > macd_h_prev and macd_h_now > -0.5: 
                     score += 1
 
-            # 4. Volume Spike (Indikasi Akumulasi)
+            # 4. Volume Spike
             if curr['Volume'] > (curr['VOL_MA5'] * 1.5):
                 score += 2
                 reasons.append("Volume Spike (>1.5x Avg)")
 
-            # 5. Trend Filter (Opsional: Bonus poin jika di atas MA200)
+            # 5. Trend Filter
             if pd.notna(curr['SMA_200']) and curr['Close'] > curr['SMA_200']:
                 score += 1
                 reasons.append("Uptrend (Above MA200)")
 
-            # Kriteria Lolos: Skor Minimal 4
+            # --- TARGET PRICE (ATR BASED) ---
+            # Hitung Stop Loss (SL) & Take Profit (TP)
+            # Default: Risk 1x ATR, Reward 2x ATR
+            atr = curr['ATR'] if pd.notna(curr['ATR']) else (curr['High'] - curr['Low']) # Fallback simple range
+            
+            stop_loss = curr['Close'] - (atr * 1.5)  # SL di bawah volatilitas normal
+            take_profit_1 = curr['Close'] + (atr * 2.0) # TP konservatif
+            take_profit_2 = curr['Close'] + (atr * 4.0) # TP agresif
+
             if score >= 4:
                 candidates.append({
                     'symbol': ticker,
                     'price': curr['Close'],
                     'rsi': curr['RSI'],
-                    'volume': curr['Volume'],
                     'score': score,
+                    'sl': stop_loss,
+                    'tp1': take_profit_1,
+                    'tp2': take_profit_2,
                     'reasons': ", ".join(reasons)
                 })
 
         except Exception as e:
-            # print(f"Error {ticker}: {e}")
             continue
             
     return candidates
@@ -207,7 +222,6 @@ def main():
         candidates = process_batch(batch)
         final_candidates.extend(candidates)
         
-        # Jeda singkat antar batch
         time.sleep(1)
 
     # 3. Urutkan & Filter Top Picks
@@ -216,15 +230,17 @@ def main():
 
     # 4. Kirim Laporan
     if top_picks:
-        msg = "🚀 *SCREENER SAHAM PREMIUM* 🚀\n"
-        mode_text = "pandas-ta" if HAS_PANDAS_TA else "Manual-Mode"
+        msg = "🚀 *SCREENER SAHAM + SIGNAL* 🚀\n"
+        mode_text = "pandas-ta" if HAS_PANDAS_TA else "Manual"
         msg += f"_Scanned {len(unique_tickers)} stocks ({mode_text}) in {int(time.time() - start_time)}s_\n\n"
         
         for i, stock in enumerate(top_picks, 1):
             icon = "🔥" if stock['score'] >= 6 else "✅"
             msg += f"{icon} *{stock['symbol']}* (Skor: {stock['score']})\n"
-            msg += f"   M: {stock['price']:.0f} | RSI: {stock['rsi']:.1f}\n"
-            msg += f"   Sinyal: _{stock['reasons']}_\n\n"
+            msg += f"   💵 Close: {stock['price']:.0f}\n"
+            msg += f"   🎯 TP1: {stock['tp1']:.0f} | TP2: {stock['tp2']:.0f}\n"
+            msg += f"   🛡️ SL: {stock['sl']:.0f}\n"
+            msg += f"   💡 `{stock['reasons']}`\n\n"
             
         if len(msg) > 4000:
             msg = msg[:4000] + "\n...(terpotong)"
