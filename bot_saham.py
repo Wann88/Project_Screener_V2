@@ -1,10 +1,18 @@
 import pandas as pd
 import yfinance as yf
-# import pandas_ta as ta  <-- Removed dependency due to install issues
 import time
 import requests
 import os
 import sys
+
+# Coba import pandas_ta, jika gagal pakai fallback manual
+try:
+    import pandas_ta as ta
+    HAS_PANDAS_TA = True
+    print("Menggunakan library: pandas-ta")
+except ImportError:
+    HAS_PANDAS_TA = False
+    print("pandas-ta tidak ditemukan. Menggunakan perhitungan manual (Fallback Mode).")
 
 # Konfigurasi
 BATCH_SIZE = 50  # Jumlah saham per batch unduhan
@@ -27,42 +35,50 @@ def send_telegram(message):
     except Exception as e:
         print(f"Gagal mengirim pesan ke Telegram: {e}")
 
-# --- MANUAL INDICATOR CALCULATIONS ---
-def calculate_rsi(series, period=14):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
-
 def calculate_technical(df):
-    """Menghitung indikator teknikal secara manual menggunakan Pandas."""
+    """Menghitung indikator teknikal (Support pandas-ta & Manual)."""
     if df.empty or len(df) < 50:
         return None
     
     # Copy untuk menghindari peringatan SettingWithCopy
     df = df.copy()
 
-    # 1. RSI 14 (Manual Calculation)
-    delta = df['Close'].diff()
-    # Gunakan EWMA agar lebih mulus seperti standar RSI
-    gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, adjust=False).mean()
-    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
-    
-    # 2. MACD (12, 26, 9)
-    k = df['Close'].ewm(span=12, adjust=False).mean() # Fast
-    d = df['Close'].ewm(span=26, adjust=False).mean() # Slow
-    df['MACD_12_26'] = k - d
-    df['MACDh_12_26_9'] = df['MACD_12_26'] - df['MACD_12_26'].ewm(span=9, adjust=False).mean() # Histogram
-    
-    # 3. Moving Averages (Trend Filter)
-    df['SMA_200'] = df['Close'].rolling(window=200).mean()
-    df['SMA_50'] = df['Close'].rolling(window=50).mean()
+    if HAS_PANDAS_TA:
+        # --- MENGGUNAKAN PANDAS-TA (JIKA ADA) ---
+        # 1. RSI 14
+        df['RSI'] = df.ta.rsi(length=14)
+        
+        # 2. MACD (12, 26, 9)
+        macd = df.ta.macd(fast=12, slow=26, signal=9)
+        if macd is not None:
+            df = pd.concat([df, macd], axis=1)
+        
+        # 3. Moving Averages
+        df['SMA_200'] = df.ta.sma(length=200)
+        df['SMA_50'] = df.ta.sma(length=50)
 
-    # 4. Volume Moving Average
+    else:
+        # --- MANUAL CALCULATION (FALLBACK) ---
+        # 1. RSI 14
+        delta = df['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, adjust=False).mean()
+        loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
+        rs = gain / loss
+        df['RSI'] = 100 - (100 / (1 + rs))
+        
+        # 2. MACD (12, 26, 9)
+        k = df['Close'].ewm(span=12, adjust=False).mean()
+        d = df['Close'].ewm(span=26, adjust=False).mean()
+        df['MACD_12_26'] = k - d
+        # MACDh_12_26_9 adalah Histogram (MACD - Signal)
+        # Note: Nama kolom harus disamakan manual agar logic di bawah tetap jalan
+        df['MACDh_12_26_9'] = df['MACD_12_26'] - df['MACD_12_26'].ewm(span=9, adjust=False).mean() 
+        
+        # 3. Moving Averages
+        df['SMA_200'] = df['Close'].rolling(window=200).mean()
+        df['SMA_50'] = df['Close'].rolling(window=50).mean()
+
+    # 4. Volume Moving Average (Sama untuk kedua mode)
     df['VOL_MA5'] = df['Volume'].rolling(window=5).mean()
 
     return df
@@ -116,6 +132,9 @@ def process_batch(tickers):
                 continue
 
             # 2. RSI Oversold tapi Mulai Rebound
+            # Pastikan kolom RSI ada (pandas-ta kadang return NaN di awal data, tapi kita ambil iloc[-1])
+            if pd.isna(curr['RSI']): continue
+            
             if curr['RSI'] < 30:
                 score += 3
                 reasons.append("RSI Oversold (<30)")
@@ -124,12 +143,16 @@ def process_batch(tickers):
                 reasons.append("RSI Murah (<40)")
             
             # 3. MACD Golden Cross atau Menguat
-            # Note: MACDh_12_26_9 adalah Histogram. Jika > 0 berarti MACD Line > Signal Line
-            if curr['MACDh_12_26_9'] > 0 and prev['MACDh_12_26_9'] < 0:
-                score += 4
-                reasons.append("MACD Golden Cross")
-            elif curr['MACDh_12_26_9'] > prev['MACDh_12_26_9'] and curr['MACDh_12_26_9'] > -0.5: 
-                score += 1
+            # Pastikan kolom MACD ada
+            if 'MACDh_12_26_9' in df.columns:
+                macd_h_now = curr['MACDh_12_26_9']
+                macd_h_prev = prev['MACDh_12_26_9']
+                
+                if macd_h_now > 0 and macd_h_prev < 0:
+                    score += 4
+                    reasons.append("MACD Golden Cross")
+                elif macd_h_now > macd_h_prev and macd_h_now > -0.5: 
+                    score += 1
 
             # 4. Volume Spike (Indikasi Akumulasi)
             if curr['Volume'] > (curr['VOL_MA5'] * 1.5):
@@ -153,6 +176,7 @@ def process_batch(tickers):
                 })
 
         except Exception as e:
+            # print(f"Error {ticker}: {e}")
             continue
             
     return candidates
@@ -192,8 +216,9 @@ def main():
 
     # 4. Kirim Laporan
     if top_picks:
-        msg = "🚀 *SCREENER SAHAM PREMIUM (NO-LIB)* 🚀\n"
-        msg += f"_Scanned {len(unique_tickers)} stocks in {int(time.time() - start_time)}s_\n\n"
+        msg = "🚀 *SCREENER SAHAM PREMIUM* 🚀\n"
+        mode_text = "pandas-ta" if HAS_PANDAS_TA else "Manual-Mode"
+        msg += f"_Scanned {len(unique_tickers)} stocks ({mode_text}) in {int(time.time() - start_time)}s_\n\n"
         
         for i, stock in enumerate(top_picks, 1):
             icon = "🔥" if stock['score'] >= 6 else "✅"
